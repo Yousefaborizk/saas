@@ -58,8 +58,7 @@ async def receive_webhook(request: Request):
         elif payload.get("object") == "page":
             await handle_facebook(payload)
     except Exception as e:
-        print(f"❌ CRITICAL ERROR: {str(e)}") # هيطبع الخطأ في Vercel Logs
-        # بنرجع 200 عشان Meta متفضلش تبعت نفس الرسالة تاني وتعمل لوب
+        print(f"❌ CRITICAL ERROR: {str(e)}")
         return {"status": "error", "message": str(e)}
 
     return {"status": "ok"}
@@ -78,7 +77,6 @@ async def handle_whatsapp(payload: dict):
                 print("⚠️ No phone_number_id found in metadata")
                 continue
 
-            # البحث عن الحساب (استخدمنا limit(1) بدل single() عشان ميكراشش)
             account_res = supabase.table("connected_accounts")\
                 .select("id, organization_id")\
                 .eq("platform", "whatsapp")\
@@ -187,28 +185,42 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
 # ==========================================
 @app.get("/api/cron/send-messages")
 async def send_pending_messages():
-    queue = supabase.table("message_queue")\
+    # جلب الرسائل المعلقة من الطابور
+    queue_res = supabase.table("message_queue")\
         .select("*")\
         .eq("status", "pending")\
         .lte("next_attempt_at", datetime.now(timezone.utc).isoformat())\
         .limit(10)\
         .execute()
 
-    for item in queue.data:
+    processed_count = 0
+
+    for item in queue_res.data:
         try:
-            msg = supabase.table("messages").select("*, conversations(connected_accounts(*))")\
-                .eq("id", item["message_id"]).limit(1).execute()
-            
-            if not msg.data:
+            # 1. جلب الرسالة
+            msg_res = supabase.table("messages").select("*").eq("id", item["message_id"]).limit(1).execute()
+            if not msg_res.data:
                 continue
+            msg = msg_res.data[0]
 
-            account = msg.data[0]["conversations"]["connected_accounts"]
-            token = account["access_token_encrypted"]
-            recipient = msg.data[0]["conversations"]["participant_id"]
-            text = msg.data[0]["content"]
+            # 2. جلب المحادثة
+            conv_res = supabase.table("conversations").select("*").eq("id", msg["conversation_id"]).limit(1).execute()
+            if not conv_res.data:
+                continue
+            conv = conv_res.data[0]
 
-            if account["platform"] == "whatsapp":
-                url = f"https://graph.facebook.com/{WA_API_VERSION}/{account['platform_account_id']}/messages"
+            # 3. جلب الحساب المتصل
+            acc_res = supabase.table("connected_accounts").select("*").eq("id", conv["connected_account_id"]).limit(1).execute()
+            if not acc_res.data:
+                continue
+            acc = acc_res.data[0]
+
+            recipient = conv["participant_id"]
+            token = acc["access_token_encrypted"]
+            text = msg["content"]
+
+            if acc["platform"] == "whatsapp":
+                url = f"https://graph.facebook.com/{WA_API_VERSION}/{acc['platform_account_id']}/messages"
                 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 payload = {
                     "messaging_product": "whatsapp",
@@ -216,19 +228,26 @@ async def send_pending_messages():
                     "type": "text",
                     "text": {"body": text}
                 }
+                
                 async with httpx.AsyncClient() as client:
                     res = await client.post(url, headers=headers, json=payload)
+                    
                     if res.status_code == 200:
+                        # النجاح
                         supabase.table("messages").update({"status": "sent"}).eq("id", item["message_id"]).execute()
                         supabase.table("message_queue").update({"status": "done"}).eq("id", item["id"]).execute()
+                        processed_count += 1
                     else:
-                        raise Exception(res.text)
+                        # فشل الإرسال (هنسجل الخطأ)
+                        raise Exception(f"Meta API Error: {res.status_code} - {res.text}")
+
         except Exception as e:
             print(f"Error sending message: {e}")
+            # تحديث المحاولة عشان ميفضلش يحاول للأبد
             supabase.table("message_queue").update({
                 "attempts": item["attempts"] + 1,
                 "status": "failed" if item["attempts"] >= item["max_attempts"] else "pending",
-                "last_error": str(e)
+                "last_error": str(e)[:255] # نسجل أول 255 حرف من الخطأ
             }).eq("id", item["id"]).execute()
 
-    return {"status": "done", "processed": len(queue.data)}
+    return {"status": "done", "processed": processed_count}

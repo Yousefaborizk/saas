@@ -72,7 +72,6 @@ async def handle_whatsapp(payload: dict):
             if not phone_number_id:
                 continue
 
-            # البحث عن الحساب المتصل
             account = supabase.table("connected_accounts")\
                 .select("id, organization_id")\
                 .eq("platform", "whatsapp")\
@@ -85,11 +84,10 @@ async def handle_whatsapp(payload: dict):
             org_id = account.data["organization_id"]
             account_id = account.data["id"]
 
-            # معالجة الرسائل الجديدة
             if "messages" in value:
                 for msg in value["messages"]:
                     if msg.get("type") != "text":
-                        continue # نتجاهل غير النصوص مؤقتاً
+                        continue
                     
                     sender = msg.get("from")
                     text = msg.get("text", {}).get("body", "")
@@ -128,10 +126,9 @@ async def handle_facebook(payload: dict):
                 )
 
 # ==========================================
-# 5. دالة مساعدة: تخزين الرسائل في قاعدة البيانات
+# 5. دالة مساعدة: تخزين الرسائل
 # ==========================================
 async def process_incoming_message(org_id, account_id, participant_id, platform, text):
-    # 1. البحث عن محادثة موجودة أو إنشاء جديدة
     conv = supabase.table("conversations")\
         .select("id")\
         .eq("organization_id", org_id)\
@@ -152,7 +149,6 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
         }).execute()
         conv_id = new_conv.data[0]["id"]
 
-    # 2. إضافة الرسالة
     supabase.table("messages").insert({
         "organization_id": org_id,
         "conversation_id": conv_id,
@@ -161,18 +157,16 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
         "status": "received"
     }).execute()
 
-    # 3. تحديث آخر رسالة في المحادثة
     supabase.table("conversations").update({
         "last_message_preview": text[:50],
         "last_message_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", conv_id).execute()
 
 # ==========================================
-# 6. دالة إرسال الرسائل (Cron Job - Vercel)
+# 6. دالة إرسال الرسائل (Cron Job)
 # ==========================================
 @app.get("/api/cron/send-messages")
 async def send_pending_messages():
-    # جلب الرسائل المعلقة
     queue = supabase.table("message_queue")\
         .select("*")\
         .eq("status", "pending")\
@@ -182,7 +176,6 @@ async def send_pending_messages():
 
     for item in queue.data:
         try:
-            # جلب بيانات الرسالة والحساب
             msg = supabase.table("messages").select("*, conversations(connected_accounts(*))")\
                 .eq("id", item["message_id"]).single().execute()
             
@@ -203,21 +196,15 @@ async def send_pending_messages():
                     "type": "text",
                     "text": {"body": text}
                 }
-            else: # facebook
-                # فيسبوك محتاج صلاحيات و tokens مختلفة (Page Access Token)
-                continue
-
-            async with httpx.AsyncClient() as client:
-                res = await client.post(url, headers=headers, json=payload)
-                if res.status_code == 200:
-                    supabase.table("messages").update({"status": "sent"}).eq("id", item["message_id"]).execute()
-                    supabase.table("message_queue").update({"status": "done"}).eq("id", item["id"]).execute()
-                else:
-                    raise Exception(res.text)
-
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(url, headers=headers, json=payload)
+                    if res.status_code == 200:
+                        supabase.table("messages").update({"status": "sent"}).eq("id", item["message_id"]).execute()
+                        supabase.table("message_queue").update({"status": "done"}).eq("id", item["id"]).execute()
+                    else:
+                        raise Exception(res.text)
         except Exception as e:
             print(f"Error sending message: {e}")
-            # تحديث المحاولة
             supabase.table("message_queue").update({
                 "attempts": item["attempts"] + 1,
                 "status": "failed" if item["attempts"] >= item["max_attempts"] else "pending",

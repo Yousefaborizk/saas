@@ -52,10 +52,15 @@ async def receive_webhook(request: Request):
 
     payload = await request.json()
     
-    if payload.get("object") == "whatsapp_business_account":
-        await handle_whatsapp(payload)
-    elif payload.get("object") == "page":
-        await handle_facebook(payload)
+    try:
+        if payload.get("object") == "whatsapp_business_account":
+            await handle_whatsapp(payload)
+        elif payload.get("object") == "page":
+            await handle_facebook(payload)
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR: {str(e)}") # هيطبع الخطأ في Vercel Logs
+        # بنرجع 200 عشان Meta متفضلش تبعت نفس الرسالة تاني وتعمل لوب
+        return {"status": "error", "message": str(e)}
 
     return {"status": "ok"}
 
@@ -70,19 +75,22 @@ async def handle_whatsapp(payload: dict):
             phone_number_id = metadata.get("phone_number_id")
             
             if not phone_number_id:
+                print("⚠️ No phone_number_id found in metadata")
                 continue
 
-            account = supabase.table("connected_accounts")\
+            # البحث عن الحساب (استخدمنا limit(1) بدل single() عشان ميكراشش)
+            account_res = supabase.table("connected_accounts")\
                 .select("id, organization_id")\
                 .eq("platform", "whatsapp")\
                 .eq("platform_account_id", phone_number_id)\
-                .single().execute()
+                .limit(1).execute()
 
-            if not account.data:
+            if not account_res.data:
+                print(f"⚠️ Account not found for phone_number_id: {phone_number_id}")
                 continue
 
-            org_id = account.data["organization_id"]
-            account_id = account.data["id"]
+            org_id = account_res.data[0]["organization_id"]
+            account_id = account_res.data[0]["id"]
 
             if "messages" in value:
                 for msg in value["messages"]:
@@ -97,23 +105,24 @@ async def handle_whatsapp(payload: dict):
                     )
 
 # ==========================================
-# 4. معالجة رسائل وكومنتات فيسبوك
+# 4. معالجة رسائل وكومنتات فيسبوك (مبدئي)
 # ==========================================
 async def handle_facebook(payload: dict):
     for entry in payload.get("entry", []):
         page_id = entry.get("id")
         
-        account = supabase.table("connected_accounts")\
+        account_res = supabase.table("connected_accounts")\
             .select("id, organization_id")\
             .eq("platform", "facebook")\
             .eq("platform_account_id", page_id)\
-            .single().execute()
+            .limit(1).execute()
 
-        if not account.data:
+        if not account_res.data:
+            print(f"⚠️ FB Account not found for page_id: {page_id}")
             continue
 
-        org_id = account.data["organization_id"]
-        account_id = account.data["id"]
+        org_id = account_res.data[0]["organization_id"]
+        account_id = account_res.data[0]["id"]
 
         for messaging in entry.get("messaging", []):
             sender = messaging.get("sender", {}).get("id")
@@ -126,41 +135,52 @@ async def handle_facebook(payload: dict):
                 )
 
 # ==========================================
-# 5. دالة مساعدة: تخزين الرسائل
+# 5. دالة مساعدة: تخزين الرسائل في قاعدة البيانات
 # ==========================================
 async def process_incoming_message(org_id, account_id, participant_id, platform, text):
-    conv = supabase.table("conversations")\
-        .select("id")\
-        .eq("organization_id", org_id)\
-        .eq("connected_account_id", account_id)\
-        .eq("platform_thread_id", participant_id)\
-        .execute()
+    try:
+        # البحث عن محادثة موجودة
+        conv_res = supabase.table("conversations")\
+            .select("id")\
+            .eq("organization_id", org_id)\
+            .eq("connected_account_id", account_id)\
+            .eq("platform_thread_id", participant_id)\
+            .limit(1).execute()
 
-    if conv.data and len(conv.data) > 0:
-        conv_id = conv.data[0]["id"]
-    else:
-        new_conv = supabase.table("conversations").insert({
+        if conv_res.data:
+            conv_id = conv_res.data[0]["id"]
+        else:
+            # إنشاء محادثة جديدة لو مش موجودة
+            new_conv = supabase.table("conversations").insert({
+                "organization_id": org_id,
+                "connected_account_id": account_id,
+                "platform_thread_id": participant_id,
+                "participant_id": participant_id,
+                "participant_name": "عميل جديد",
+                "status": "open"
+            }).execute()
+            conv_id = new_conv.data[0]["id"]
+
+        # إضافة الرسالة
+        supabase.table("messages").insert({
             "organization_id": org_id,
-            "connected_account_id": account_id,
-            "platform_thread_id": participant_id,
-            "participant_id": participant_id,
-            "participant_name": "عميل جديد",
-            "status": "open"
+            "conversation_id": conv_id,
+            "sender_type": "customer",
+            "content": text,
+            "status": "received"
         }).execute()
-        conv_id = new_conv.data[0]["id"]
 
-    supabase.table("messages").insert({
-        "organization_id": org_id,
-        "conversation_id": conv_id,
-        "sender_type": "customer",
-        "content": text,
-        "status": "received"
-    }).execute()
+        # تحديث آخر رسالة في المحادثة
+        supabase.table("conversations").update({
+            "last_message_preview": text[:50],
+            "last_message_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", conv_id).execute()
+        
+        print(f"✅ Message saved successfully from {participant_id}")
 
-    supabase.table("conversations").update({
-        "last_message_preview": text[:50],
-        "last_message_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", conv_id).execute()
+    except Exception as e:
+        print(f"❌ Error processing message: {str(e)}")
+        raise e
 
 # ==========================================
 # 6. دالة إرسال الرسائل (Cron Job)
@@ -177,15 +197,15 @@ async def send_pending_messages():
     for item in queue.data:
         try:
             msg = supabase.table("messages").select("*, conversations(connected_accounts(*))")\
-                .eq("id", item["message_id"]).single().execute()
+                .eq("id", item["message_id"]).limit(1).execute()
             
             if not msg.data:
                 continue
 
-            account = msg.data["conversations"]["connected_accounts"]
+            account = msg.data[0]["conversations"]["connected_accounts"]
             token = account["access_token_encrypted"]
-            recipient = msg.data["conversations"]["participant_id"]
-            text = msg.data["content"]
+            recipient = msg.data[0]["conversations"]["participant_id"]
+            text = msg.data[0]["content"]
 
             if account["platform"] == "whatsapp":
                 url = f"https://graph.facebook.com/{WA_API_VERSION}/{account['platform_account_id']}/messages"

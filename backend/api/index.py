@@ -42,15 +42,20 @@ async def verify_webhook(
 async def receive_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
-    if signature:
+    
+    # التحقق من التوقيع (موصى به بشدة في الإنتاج)
+    if signature and META_APP_SECRET:
         expected_signature = "sha256=" + hmac.new(
             META_APP_SECRET.encode(), body, hashlib.sha256
         ).hexdigest()
         if not hmac.compare_digest(expected_signature, signature):
             raise HTTPException(status_code=403, detail="Invalid signature")
 
-    payload = await request.json()
-    
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
     try:
         if payload.get("object") == "whatsapp_business_account":
             await handle_whatsapp(payload)
@@ -130,7 +135,7 @@ async def handle_facebook(payload: dict):
             message = messaging.get("message", {})
             text = message.get("text", "")
             
-            # 🌟 التعديل الأهم: تجاهل الرسايل اللي بتبعت من الصفحة نفسها (Echo)
+            # تجاهل الرسايل اللي بتبعت من الصفحة نفسها (Echo)
             is_echo = message.get("is_echo", False)
             if is_echo:
                 print("⏩ Ignoring Echo message (sent by the page itself).")
@@ -150,11 +155,20 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
         if platform == "facebook" and token:
             try:
                 async with httpx.AsyncClient() as client:
-                    api_url = f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=name&access_token={token}"
+                    # استخدام first_name و last_name للحصول على الاسم كاملاً
+                    api_url = f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=first_name,last_name&access_token={token}"
                     res = await client.get(api_url)
-                    print(f"🔍 FB Name API Status: {res.status_code} | Response: {res.text}") # عشان نشوف الإيرور في Vercel Logs
+                    
+                    print(f"🔍 FB Name API Status: {res.status_code} | Response: {res.text}")
+                    
                     if res.status_code == 200:
-                        default_name = res.json().get("name", default_name)
+                        data = res.json()
+                        first = data.get("first_name", "")
+                        last = data.get("last_name", "")
+                        if first or last:
+                            default_name = f"{first} {last}".strip()
+                    else:
+                        print(f"⚠️ Failed to fetch FB name. Check access token permissions.")
             except Exception as e:
                 print(f"❌ Could not fetch FB name: {e}")
 

@@ -40,7 +40,6 @@ async def verify_webhook(
 # ==========================================
 @app.post("/api/webhook")
 async def receive_webhook(request: Request):
-    # التحقق من التوقيع
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
     if signature:
@@ -89,7 +88,6 @@ async def handle_whatsapp(payload: dict):
             org_id = account_res.data[0]["organization_id"]
             account_id = account_res.data[0]["id"]
 
-            # جلب اسم العميل من الـ payload بتاع واتساب
             contact_name = "عميل واتساب"
             if "contacts" in value and len(value["contacts"]) > 0:
                 contact_name = value["contacts"][0].get("profile", {}).get("name", "عميل واتساب")
@@ -132,8 +130,13 @@ async def handle_facebook(payload: dict):
             message = messaging.get("message", {})
             text = message.get("text", "")
             
+            # 🌟 التعديل الأهم: تجاهل الرسايل اللي بتبعت من الصفحة نفسها (Echo)
+            is_echo = message.get("is_echo", False)
+            if is_echo:
+                print("⏩ Ignoring Echo message (sent by the page itself).")
+                continue
+            
             if sender and text:
-                # بنبعت الـ token عشان الدالة تجيب اسم العميل من فيسبوك
                 await process_incoming_message(
                     org_id, account_id, sender, "facebook", text, "عميل فيسبوك", token
                 )
@@ -147,11 +150,13 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
         if platform == "facebook" and token:
             try:
                 async with httpx.AsyncClient() as client:
-                    res = await client.get(f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=name&access_token={token}")
+                    api_url = f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=name&access_token={token}"
+                    res = await client.get(api_url)
+                    print(f"🔍 FB Name API Status: {res.status_code} | Response: {res.text}") # عشان نشوف الإيرور في Vercel Logs
                     if res.status_code == 200:
                         default_name = res.json().get("name", default_name)
             except Exception as e:
-                print(f"Could not fetch FB name: {e}")
+                print(f"❌ Could not fetch FB name: {e}")
 
         # البحث عن محادثة موجودة
         conv_res = supabase.table("conversations")\
@@ -163,12 +168,11 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
 
         if conv_res.data:
             conv_id = conv_res.data[0]["id"]
-            # تحديث الاسم لو كان لسه "عميل جديد"
+            # تحديث الاسم لو كان لسه "عميل فيسبوك"
             supabase.table("conversations").update({
                 "participant_name": default_name
             }).eq("id", conv_id).execute()
         else:
-            # إنشاء محادثة جديدة بالاسم اللي جبناه
             new_conv = supabase.table("conversations").insert({
                 "organization_id": org_id,
                 "connected_account_id": account_id,
@@ -179,7 +183,6 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
             }).execute()
             conv_id = new_conv.data[0]["id"]
 
-        # إضافة الرسالة
         supabase.table("messages").insert({
             "organization_id": org_id,
             "conversation_id": conv_id,
@@ -188,7 +191,6 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
             "status": "received"
         }).execute()
 
-        # تحديث آخر رسالة في المحادثة
         supabase.table("conversations").update({
             "last_message_preview": text[:50],
             "last_message_at": datetime.now(timezone.utc).isoformat()
@@ -205,7 +207,6 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
 # ==========================================
 @app.get("/api/cron/send-messages")
 async def send_pending_messages():
-    # جلب الرسائل المعلقة من الطابور
     queue_res = supabase.table("message_queue")\
         .select("*")\
         .eq("status", "pending")\
@@ -217,22 +218,16 @@ async def send_pending_messages():
 
     for item in queue_res.data:
         try:
-            # 1. جلب الرسالة
             msg_res = supabase.table("messages").select("*").eq("id", item["message_id"]).limit(1).execute()
-            if not msg_res.data:
-                continue
+            if not msg_res.data: continue
             msg = msg_res.data[0]
 
-            # 2. جلب المحادثة
             conv_res = supabase.table("conversations").select("*").eq("id", msg["conversation_id"]).limit(1).execute()
-            if not conv_res.data:
-                continue
+            if not conv_res.data: continue
             conv = conv_res.data[0]
 
-            # 3. جلب الحساب المتصل
             acc_res = supabase.table("connected_accounts").select("*").eq("id", conv["connected_account_id"]).limit(1).execute()
-            if not acc_res.data:
-                continue
+            if not acc_res.data: continue
             acc = acc_res.data[0]
 
             recipient = conv["participant_id"]
@@ -257,25 +252,21 @@ async def send_pending_messages():
                     "message": {"text": text}
                 }
             else:
-                print(f"⚠️ Platform {acc['platform']} not supported.")
                 continue
 
             async with httpx.AsyncClient() as client:
                 res = await client.post(url, headers=headers, json=payload)
                 
                 if res.status_code == 200:
-                    # النجاح
                     supabase.table("messages").update({"status": "sent"}).eq("id", item["message_id"]).execute()
                     supabase.table("message_queue").update({"status": "done"}).eq("id", item["id"]).execute()
                     processed_count += 1
                     print(f"✅ Message sent successfully to {recipient} via {acc['platform']}")
                 else:
-                    # فشل الإرسال (هنسجل الخطأ)
                     raise Exception(f"Meta API Error: {res.status_code} - {res.text}")
 
         except Exception as e:
             print(f"Error sending message: {e}")
-            # تحديث المحاولة عشان ميفضلش يحاول للأبد
             supabase.table("message_queue").update({
                 "attempts": item["attempts"] + 1,
                 "status": "failed" if item["attempts"] >= item["max_attempts"] else "pending",

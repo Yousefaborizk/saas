@@ -50,9 +50,10 @@ class _InboxScreenState extends State<InboxScreen> {
           .eq('id', user.id)
           .single();
 
+      // بنجيب بيانات المحادثة + بيانات الحساب المتصل عشان نعرف المنصة
       final res = await _supabase
           .from('conversations')
-          .select()
+          .select('*, connected_accounts(platform)')
           .eq('organization_id', userData['organization_id'])
           .order('last_message_at', ascending: false);
 
@@ -63,6 +64,7 @@ class _InboxScreenState extends State<InboxScreen> {
         });
       }
     } catch (e) {
+      debugPrint('Error: $e');
       if (mounted) setState(() => _isLoading = false);
     }
   }
@@ -70,9 +72,12 @@ class _InboxScreenState extends State<InboxScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFF3F4F6),
       appBar: AppBar(
-        title: const Text('صندوق الرسائل'),
+        title: const Text('صندوق الرسائل',
+            style: TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Colors.white,
+        elevation: 1,
         actions: [
           Container(
             margin: const EdgeInsets.only(right: 16),
@@ -94,34 +99,96 @@ class _InboxScreenState extends State<InboxScreen> {
           : _conversations.isEmpty
               ? const Center(
                   child: Text('لا توجد رسائل حتى الآن',
-                      style: TextStyle(color: Colors.grey)))
+                      style: TextStyle(color: Colors.grey, fontSize: 16)))
               : ListView.builder(
                   padding: const EdgeInsets.all(16),
                   itemCount: _conversations.length,
                   itemBuilder: (context, index) {
                     final conv = _conversations[index];
                     final isOpen = conv['status'] == 'open';
+                    final platform =
+                        conv['connected_accounts']?['platform'] ?? 'whatsapp';
+                    final isWhatsApp = platform == 'whatsapp';
+                    final name = conv['participant_name'] ?? 'عميل';
+
                     return Card(
                       margin: const EdgeInsets.only(bottom: 12),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16)),
+                      elevation: 0,
+                      color: Colors.white,
                       child: ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 8),
                         onTap: () => context.push('/chat', extra: {
                           'id': conv['id'],
-                          'name': conv['participant_name'] ?? 'عميل',
+                          'name': name,
                         }),
-                        leading: CircleAvatar(
-                          backgroundColor: Colors.deepPurple.shade50,
-                          child: Text((conv['participant_name'] ?? 'ع')[0],
-                              style: const TextStyle(color: Colors.deepPurple)),
+                        leading: Stack(
+                          children: [
+                            CircleAvatar(
+                              radius: 24,
+                              backgroundColor: isWhatsApp
+                                  ? Colors.green.shade50
+                                  : Colors.blue.shade50,
+                              child: Text(
+                                name.isNotEmpty ? name[0].toUpperCase() : 'ع',
+                                style: TextStyle(
+                                  color:
+                                      isWhatsApp ? Colors.green : Colors.blue,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 18,
+                                ),
+                              ),
+                            ),
+                            // أيقونة المنصة
+                            Positioned(
+                              bottom: 0,
+                              right: 0,
+                              child: Container(
+                                padding: const EdgeInsets.all(2),
+                                decoration: const BoxDecoration(
+                                  color: Colors.white,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  isWhatsApp ? Icons.chat : Icons.facebook,
+                                  color:
+                                      isWhatsApp ? Colors.green : Colors.blue,
+                                  size: 16,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                        title: Text(conv['participant_name'] ?? 'عميل',
-                            style:
-                                const TextStyle(fontWeight: FontWeight.bold)),
-                        subtitle: Text(conv['last_message_preview'] ?? '',
-                            maxLines: 1, overflow: TextOverflow.ellipsis),
-                        trailing: Text(isOpen ? 'مفتوحة' : 'مغلقة',
-                            style: TextStyle(
+                        title: Text(
+                          name,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                        subtitle: Text(
+                          conv['last_message_preview'] ?? '',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: Colors.grey.shade600),
+                        ),
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              'مفتوحة',
+                              style: TextStyle(
                                 color: isOpen ? Colors.green : Colors.grey,
-                                fontSize: 12)),
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Icon(Icons.arrow_forward_ios,
+                                size: 12, color: Colors.grey.shade400),
+                          ],
+                        ),
                       ),
                     );
                   },

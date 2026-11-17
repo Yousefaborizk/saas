@@ -77,7 +77,7 @@ async def handle_whatsapp(payload: dict):
                 continue
 
             account_res = supabase.table("connected_accounts")\
-                .select("id, organization_id")\
+                .select("id, organization_id, access_token_encrypted")\
                 .eq("platform", "whatsapp")\
                 .eq("platform_account_id", phone_number_id)\
                 .limit(1).execute()
@@ -89,6 +89,11 @@ async def handle_whatsapp(payload: dict):
             org_id = account_res.data[0]["organization_id"]
             account_id = account_res.data[0]["id"]
 
+            # جلب اسم العميل من الـ payload بتاع واتساب
+            contact_name = "عميل واتساب"
+            if "contacts" in value and len(value["contacts"]) > 0:
+                contact_name = value["contacts"][0].get("profile", {}).get("name", "عميل واتساب")
+
             if "messages" in value:
                 for msg in value["messages"]:
                     if msg.get("type") != "text":
@@ -98,7 +103,7 @@ async def handle_whatsapp(payload: dict):
                     text = msg.get("text", {}).get("body", "")
                     
                     await process_incoming_message(
-                        org_id, account_id, sender, "whatsapp", text
+                        org_id, account_id, sender, "whatsapp", text, contact_name
                     )
 
 # ==========================================
@@ -109,7 +114,7 @@ async def handle_facebook(payload: dict):
         page_id = entry.get("id")
         
         account_res = supabase.table("connected_accounts")\
-            .select("id, organization_id")\
+            .select("id, organization_id, access_token_encrypted")\
             .eq("platform", "facebook")\
             .eq("platform_account_id", page_id)\
             .limit(1).execute()
@@ -120,6 +125,7 @@ async def handle_facebook(payload: dict):
 
         org_id = account_res.data[0]["organization_id"]
         account_id = account_res.data[0]["id"]
+        token = account_res.data[0].get("access_token_encrypted")
 
         for messaging in entry.get("messaging", []):
             sender = messaging.get("sender", {}).get("id")
@@ -127,15 +133,26 @@ async def handle_facebook(payload: dict):
             text = message.get("text", "")
             
             if sender and text:
+                # بنبعت الـ token عشان الدالة تجيب اسم العميل من فيسبوك
                 await process_incoming_message(
-                    org_id, account_id, sender, "facebook", text
+                    org_id, account_id, sender, "facebook", text, "عميل فيسبوك", token
                 )
 
 # ==========================================
 # 5. دالة مساعدة: تخزين الرسائل في قاعدة البيانات
 # ==========================================
-async def process_incoming_message(org_id, account_id, participant_id, platform, text):
+async def process_incoming_message(org_id, account_id, participant_id, platform, text, default_name="عميل جديد", token=None):
     try:
+        # لو المنصة فيسبوك، هنجيب اسم العميل الحقيقي من الـ Graph API
+        if platform == "facebook" and token:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=name&access_token={token}")
+                    if res.status_code == 200:
+                        default_name = res.json().get("name", default_name)
+            except Exception as e:
+                print(f"Could not fetch FB name: {e}")
+
         # البحث عن محادثة موجودة
         conv_res = supabase.table("conversations")\
             .select("id")\
@@ -146,14 +163,18 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
 
         if conv_res.data:
             conv_id = conv_res.data[0]["id"]
+            # تحديث الاسم لو كان لسه "عميل جديد"
+            supabase.table("conversations").update({
+                "participant_name": default_name
+            }).eq("id", conv_id).execute()
         else:
-            # إنشاء محادثة جديدة لو مش موجودة
+            # إنشاء محادثة جديدة بالاسم اللي جبناه
             new_conv = supabase.table("conversations").insert({
                 "organization_id": org_id,
                 "connected_account_id": account_id,
                 "platform_thread_id": participant_id,
                 "participant_id": participant_id,
-                "participant_name": "عميل جديد",
+                "participant_name": default_name,
                 "status": "open"
             }).execute()
             conv_id = new_conv.data[0]["id"]
@@ -173,14 +194,14 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
             "last_message_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", conv_id).execute()
         
-        print(f"✅ Message saved successfully from {participant_id} ({platform})")
+        print(f"✅ Message saved successfully from {default_name} ({platform})")
 
     except Exception as e:
         print(f"❌ Error processing message: {str(e)}")
         raise e
 
 # ==========================================
-# 6. دالة إرسال الرسائل (Cron Job) - واتساب + فيسبوك
+# 6. دالة إرسال الرسائل (Cron Job)
 # ==========================================
 @app.get("/api/cron/send-messages")
 async def send_pending_messages():
@@ -236,7 +257,7 @@ async def send_pending_messages():
                     "message": {"text": text}
                 }
             else:
-                print(f"⚠️ Platform {acc['platform']} not supported for sending yet.")
+                print(f"⚠️ Platform {acc['platform']} not supported.")
                 continue
 
             async with httpx.AsyncClient() as client:

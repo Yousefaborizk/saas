@@ -92,11 +92,13 @@ async def handle_whatsapp(payload: dict):
 
             org_id = account_res.data[0]["organization_id"]
             account_id = account_res.data[0]["id"]
+            token = account_res.data[0].get("access_token_encrypted") # لو هتحتاجه للرد التلقائي
 
             contact_name = "عميل واتساب"
             if "contacts" in value and len(value["contacts"]) > 0:
                 contact_name = value["contacts"][0].get("profile", {}).get("name", "عميل واتساب")
 
+            # الرسائل الواردة من العميل
             if "messages" in value:
                 for msg in value["messages"]:
                     if msg.get("type") != "text":
@@ -104,10 +106,17 @@ async def handle_whatsapp(payload: dict):
                     
                     sender = msg.get("from")
                     text = msg.get("text", {}).get("body", "")
+                    message_id = msg.get("id")
                     
                     await process_incoming_message(
-                        org_id, account_id, sender, "whatsapp", text, contact_name
+                        org_id, account_id, sender, "whatsapp", text, contact_name, 
+                        is_from_agent=False, external_message_id=message_id
                     )
+            
+            # رسائل الواتساب الصادرة (الـ Echo بتاع الواتساب لو موجود)
+            if "statuses" in value:
+                # في واتساب، مش بنستقبل echo كامل بنفس الطريقة، لكن لو احتجت تتابع الحالات ممكن تضيفها هنا
+                pass
 
 # ==========================================
 # 4. معالجة رسائل فيسبوك
@@ -132,47 +141,58 @@ async def handle_facebook(payload: dict):
 
         for messaging in entry.get("messaging", []):
             sender = messaging.get("sender", {}).get("id")
+            recipient = messaging.get("recipient", {}).get("id")
             message = messaging.get("message", {})
             text = message.get("text", "")
+            message_id = message.get("mid")
             
-            # تجاهل الرسايل اللي بتبعت من الصفحة نفسها (Echo)
             is_echo = message.get("is_echo", False)
-            if is_echo:
-                print("⏩ Ignoring Echo message (sent by the page itself).")
-                continue
             
-            if sender and text:
-                await process_incoming_message(
-                    org_id, account_id, sender, "facebook", text, "عميل فيسبوك", token
-                )
+            if is_echo:
+                # دي رسالة صادرة منك (من الموبايل أو من التطبيق)
+                participant_id = recipient # العميل هو المستقبل في هذه الحالة
+                
+                # التأكد إن الرسالة مش متسجلة مسبقاً (لو الـ API بتاعنا هو اللي بعتها)
+                if message_id:
+                    existing_msg = supabase.table("messages")\
+                        .select("id")\
+                        .eq("metadata->>external_message_id", message_id)\
+                        .limit(1).execute()
+                        
+                    if not existing_msg.data:
+                        await process_incoming_message(
+                            org_id, account_id, participant_id, "facebook", text, "عميل فيسبوك", token,
+                            is_from_agent=True, external_message_id=message_id
+                        )
+            else:
+                # دي رسالة واردة من العميل
+                if sender and text:
+                    await process_incoming_message(
+                        org_id, account_id, sender, "facebook", text, "عميل فيسبوك", token,
+                        is_from_agent=False, external_message_id=message_id
+                    )
 
 # ==========================================
 # 5. دالة مساعدة: تخزين الرسائل في قاعدة البيانات
 # ==========================================
-async def process_incoming_message(org_id, account_id, participant_id, platform, text, default_name="عميل جديد", token=None):
+async def process_incoming_message(org_id, account_id, participant_id, platform, text, default_name="عميل جديد", token=None, is_from_agent=False, external_message_id=None):
     try:
-        # لو المنصة فيسبوك، هنجيب اسم العميل الحقيقي من الـ Graph API
-        if platform == "facebook" and token:
+        # جلب اسم العميل (بس لو الرسالة جاية منه، مش منك)
+        if platform == "facebook" and token and not is_from_agent:
             try:
                 async with httpx.AsyncClient() as client:
-                    # استخدام first_name و last_name للحصول على الاسم كاملاً
                     api_url = f"https://graph.facebook.com/{WA_API_VERSION}/{participant_id}?fields=first_name,last_name&access_token={token}"
                     res = await client.get(api_url)
-                    
-                    print(f"🔍 FB Name API Status: {res.status_code} | Response: {res.text}")
-                    
                     if res.status_code == 200:
                         data = res.json()
                         first = data.get("first_name", "")
                         last = data.get("last_name", "")
                         if first or last:
                             default_name = f"{first} {last}".strip()
-                    else:
-                        print(f"⚠️ Failed to fetch FB name. Check access token permissions.")
             except Exception as e:
                 print(f"❌ Could not fetch FB name: {e}")
 
-        # البحث عن محادثة موجودة
+        # البحث عن محادثة موجودة أو إنشاء واحدة
         conv_res = supabase.table("conversations")\
             .select("id")\
             .eq("organization_id", org_id)\
@@ -182,10 +202,6 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
 
         if conv_res.data:
             conv_id = conv_res.data[0]["id"]
-            # تحديث الاسم لو كان لسه "عميل فيسبوك"
-            supabase.table("conversations").update({
-                "participant_name": default_name
-            }).eq("id", conv_id).execute()
         else:
             new_conv = supabase.table("conversations").insert({
                 "organization_id": org_id,
@@ -197,20 +213,33 @@ async def process_incoming_message(org_id, account_id, participant_id, platform,
             }).execute()
             conv_id = new_conv.data[0]["id"]
 
-        supabase.table("messages").insert({
+        # تحديد نوع المرسل (أنت أم العميل)
+        sender_type = "agent" if is_from_agent else "customer"
+
+        # تحضير بيانات الرسالة
+        msg_data = {
             "organization_id": org_id,
             "conversation_id": conv_id,
-            "sender_type": "customer",
+            "sender_type": sender_type,
             "content": text,
-            "status": "received"
-        }).execute()
+            "status": "sent" if is_from_agent else "received",
+        }
+        
+        # إضافة الـ metadata لو فيه message_id
+        if external_message_id:
+            msg_data["metadata"] = {"external_message_id": external_message_id}
 
+        # حفظ الرسالة
+        supabase.table("messages").insert(msg_data).execute()
+
+        # تحديث المحادثة بآخر رسالة
         supabase.table("conversations").update({
             "last_message_preview": text[:50],
             "last_message_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", conv_id).execute()
         
-        print(f"✅ Message saved successfully from {default_name} ({platform})")
+        sender_label = "Agent (You)" if is_from_agent else default_name
+        print(f"✅ Message saved successfully from {sender_label} ({platform})")
 
     except Exception as e:
         print(f"❌ Error processing message: {str(e)}")
@@ -272,7 +301,16 @@ async def send_pending_messages():
                 res = await client.post(url, headers=headers, json=payload)
                 
                 if res.status_code == 200:
-                    supabase.table("messages").update({"status": "sent"}).eq("id", item["message_id"]).execute()
+                    response_data = res.json()
+                    # بنجيب الـ message_id اللي رجع من ميتا عشان نحفظه في الـ metadata
+                    # عشان لما الـ Echo ييجي، الكود يعرف إن الرسالة دي اتسجلت خلاص وميكررهاش
+                    meta_message_id = response_data.get("message_id")
+                    
+                    update_data = {"status": "sent"}
+                    if meta_message_id:
+                        update_data["metadata"] = {"external_message_id": meta_message_id}
+                        
+                    supabase.table("messages").update(update_data).eq("id", item["message_id"]).execute()
                     supabase.table("message_queue").update({"status": "done"}).eq("id", item["id"]).execute()
                     processed_count += 1
                     print(f"✅ Message sent successfully to {recipient} via {acc['platform']}")
